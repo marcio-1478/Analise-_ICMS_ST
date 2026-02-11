@@ -3,3 +3,4 @@ __pycache__/
 .env
 .cursor/
 *.zip
+.streamlit/secrets.toml
