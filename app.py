@@ -129,7 +129,7 @@ def _render_premium_cards(total_itens: int, st_recolhida: int, antecipacao_pende
     _render_premium_cards_generic([
         ("Total de Itens", total_itens, "blue"),
         ("ST Recolhida (CFOPs 54xx/64xx)", st_recolhida, "green"),
-        ("Antecipação Pendente (NCM base + CFOP 5102/6102)", antecipacao_pendente, "red"),
+        ("Antecipação Pendente (CFOP 61xx fora PR + operação comum)", antecipacao_pendente, "red"),
         ("Valor de Risco Estimado", valor_risco, "gold"),
     ])
 
@@ -600,6 +600,8 @@ def salvar_nota_e_itens(
     cnpj_destinatario: str | None = None,
     data_emissao: str | None = None,
     totais_impostos: dict | None = None,
+    uf_origem: str | None = None,
+    cst_principal: str | None = None,
 ) -> tuple[bool, str]:
     """
     Salva uma nota fiscal e seus itens no banco de dados.
@@ -631,6 +633,10 @@ def salvar_nota_e_itens(
             nota_data["cnpj_destinatario"] = cnpj_gravar
         if data_emissao:
             nota_data["data_emissao"] = data_emissao
+        if uf_origem:
+            nota_data["uf_origem"] = str(uf_origem).strip().upper()[:2]
+        if cst_principal:
+            nota_data["cst_principal"] = str(cst_principal).strip()[:50]
         if totais_impostos:
             for k, v in totais_impostos.items():
                 if v is not None:
@@ -644,6 +650,8 @@ def salvar_nota_e_itens(
             if "PGRST204" in msg or "42703" in msg:
                 # Primeiro tenta sem cnpj_destinatario (mantém data_emissao)
                 nota_data.pop("cnpj_destinatario", None)
+                nota_data.pop("uf_origem", None)
+                nota_data.pop("cst_principal", None)
                 for k in ("icms_bc_total", "icms_st_total", "pis_total", "cofins_total", "ipi_total", "ibs_total", "cbs_total"):
                     nota_data.pop(k, None)
                 try:
@@ -692,6 +700,8 @@ def salvar_nota_e_itens(
                 ):
                     if col in item and item[col] is not None:
                         item_data[col] = float(item[col])
+                if "cst" in item and item["cst"] is not None:
+                    item_data["cst"] = str(item["cst"]).strip()
                 itens_data.append(item_data)
             
             if itens_data:
@@ -716,6 +726,7 @@ def salvar_nota_e_itens(
                                 "cofins_bc", "cofins_aliq", "cofins_valor",
                                 "ipi_bc", "ipi_aliq", "ipi_valor",
                                 "ibs_valor", "cbs_valor",
+                                "cst",
                             ):
                                 d.pop(col, None)
                         response_itens = supabase.table("itens_nota").insert(itens_data).execute()
@@ -828,6 +839,30 @@ def cfop_indica_st(cfop: str | None) -> bool:
         return False
     s = str(cfop).strip()
     return s.startswith("54") or s.startswith("64")
+
+
+def cfop_inicia_54_ou_64(cfop: str | None) -> bool:
+    """Retorna True se o CFOP inicia em 5.4 ou 6.4 (ST recolhida na origem)."""
+    if not cfop:
+        return False
+    s = str(cfop).strip()
+    return s.startswith("54") or s.startswith("64")
+
+
+def cfop_inicia_61(cfop: str | None) -> bool:
+    """Retorna True se o CFOP inicia em 6.1 (operação interestadual)."""
+    if not cfop:
+        return False
+    s = str(cfop).strip()
+    return s.startswith("61")
+
+
+def cfop_inicia_51(cfop: str | None) -> bool:
+    """Retorna True se o CFOP inicia em 5.1 (venda interna)."""
+    if not cfop:
+        return False
+    s = str(cfop).strip()
+    return s.startswith("51")
 
 
 def cfop_5405_ou_5403(cfop: str | None) -> bool:
@@ -1099,9 +1134,35 @@ def extrair_data_emissao_ide(ide: dict) -> str | None:
     return None
 
 
+def _extrair_cst_icms(icms: dict) -> str | None:
+    """
+    Extrai CST do bloco ICMS do item.
+    Retorna CST (2 dígitos) ou CSOSN (1 dígito para Simples Nacional) ou None.
+    """
+    if not isinstance(icms, dict):
+        return None
+    bloco = _primeiro_bloco(icms)
+    if not bloco:
+        return None
+    cst = bloco.get("CST") or bloco.get("cst")
+    if cst is not None and str(cst).strip():
+        return str(cst).strip()
+    csosn = bloco.get("CSOSN") or bloco.get("csosn")
+    if csosn is not None and str(csosn).strip():
+        return str(csosn).strip()
+    # Fallback: deriva do nome do bloco (ICMS00 -> 00, ICMS10 -> 10)
+    for k, v in icms.items():
+        if isinstance(v, dict) and k.startswith("ICMS"):
+            suf = k.replace("ICMS", "").strip()
+            if suf.isdigit():
+                return suf.zfill(2)
+    return None
+
+
 def extrair_impostos_item(item: dict) -> dict:
     """
     Extrai base, alíquota e valor de ICMS, ICMS-ST, PIS, COFINS, IPI, IBS e CBS do item.
+    Também extrai CST (Código de Situação Tributária) do bloco ICMS.
     Retorna dict com chaves em snake_case para persistência.
     """
     imp = item.get("imposto", {}) or {}
@@ -1112,6 +1173,7 @@ def extrair_impostos_item(item: dict) -> dict:
         "cofins_bc": None, "cofins_aliq": None, "cofins_valor": None,
         "ipi_bc": None, "ipi_aliq": None, "ipi_valor": None,
         "ibs_valor": None, "cbs_valor": None,
+        "cst": None,
     }
 
     try:
@@ -1125,6 +1187,7 @@ def extrair_impostos_item(item: dict) -> dict:
             resultado["icms_st_bc"] = safe_float(bloco.get("vBCST"))
             resultado["icms_st_aliq"] = safe_float(bloco.get("pICMSST")) or safe_float(bloco.get("pMST"))
             resultado["icms_st_valor"] = safe_float(bloco.get("vICMSST")) or safe_float(bloco.get("vST"))
+            resultado["cst"] = _extrair_cst_icms(icms)
         # ICMSST pode estar em bloco próprio (ex: grupo ICMSST)
         icms_st = imp.get("ICMSST", {}) or {}
         if isinstance(icms_st, dict):
@@ -1224,6 +1287,16 @@ def processar_xml(
             cnpj_destinatario = limpar_cnpj(raw_cnpj_dest) if raw_cnpj_dest else None
         except (KeyError, AttributeError, TypeError):
             pass
+
+        # Extrai UF do emitente (origem da mercadoria) para auditoria de ST
+        uf_origem = None
+        try:
+            emit = inf_nfe.get("emit", {})
+            ender = emit.get("enderEmit", {}) if isinstance(emit, dict) else {}
+            uf_raw = ender.get("UF") or ender.get("uf") if isinstance(ender, dict) else None
+            uf_origem = str(uf_raw).strip().upper()[:2] if uf_raw else None
+        except (KeyError, AttributeError, TypeError):
+            pass
         
         alerta_cliente = None
         nome_cliente = None
@@ -1274,9 +1347,10 @@ def processar_xml(
         except (ValueError, TypeError):
             icms_st_zerado = True
 
-        # Processa cada item e identifica CFOPs
+        # Processa cada item e identifica CFOPs e CSTs
         tem_cfop_6 = False
         cfops_encontrados = set()
+        csts_encontrados: set[str] = set()
         itens_para_salvar = []
         ncm_cache: dict[str, dict | None] = {}
         sujeito_st_pr = False
@@ -1308,6 +1382,7 @@ def processar_xml(
                     if str(cfop).startswith("6"):
                         tem_cfop_6 = True
 
+
                 # Verifica se o NCM/CEST está na base normativa (CEST primeiro, depois NCM)
                 regra_st = None
                 if ncm and ncm != "N/A":
@@ -1334,6 +1409,12 @@ def processar_xml(
                     mva_val = regra_st["mva_remanescente"]
                     mva_remanescente_val = f"{float(mva_val) * 100:.1f}%" if mva_val else None
 
+                # Impostos extraídos do XML (base, alíquota, valor, cst)
+                impostos = extrair_impostos_item(item)
+                if impostos.get("cst"):
+                    csts_encontrados.add(str(impostos["cst"]).strip())
+                cst_exibir = impostos.get("cst") or "—"
+
                 # Dados para exibição
                 todos_itens.append({
                     "Arquivo": nome_arquivo,
@@ -1342,6 +1423,7 @@ def processar_xml(
                     "Descrição": descricao,
                     "NCM": ncm,
                     "CFOP": cfop,
+                    "CST": cst_exibir,
                     "Valor Produto": safe_float(valor_total),
                     "IPI": valor_ipi,
                     "Frete": valor_frete,
@@ -1349,9 +1431,6 @@ def processar_xml(
                     "Status ST": status_st,
                     "MVA Remanescente": mva_remanescente_val,
                 })
-                
-                # Impostos extraídos do XML (base, alíquota, valor)
-                impostos = extrair_impostos_item(item)
 
                 # Dados para salvar no banco (NCM normalizado: só dígitos; status_st para Painel)
                 ncm_limpo = limpar_ncm(ncm) if ncm and ncm != "N/A" else None
@@ -1366,10 +1445,15 @@ def processar_xml(
                     "valor_total": float(valor_total) if valor_total else 0.0,
                     "status_st": status_st_gravar,
                 }
-                # Adiciona impostos ao item (base, alíquota, valor)
+                # Adiciona impostos ao item (base, alíquota, valor, cst)
                 for k, v in impostos.items():
                     if v is not None:
-                        item_salvar[k] = float(v) if isinstance(v, (int, float)) else v
+                        if k == "cst":
+                            item_salvar[k] = str(v).strip()
+                        elif isinstance(v, (int, float)):
+                            item_salvar[k] = float(v)
+                        else:
+                            item_salvar[k] = v
                 itens_para_salvar.append(item_salvar)
             except (KeyError, AttributeError, TypeError) as e:
                 st.warning(f"Erro ao processar item ({nome_arquivo}): {e}")
@@ -1382,6 +1466,11 @@ def processar_xml(
                 cfop_principal = list(cfops_encontrados)[0]
             else:
                 cfop_principal = f"Múltiplos ({', '.join(sorted(cfops_encontrados))})"
+
+        # Determina CST principal (primeiro encontrado ou "Múltiplos" se houver vários)
+        cst_principal = None
+        if csts_encontrados:
+            cst_principal = list(csts_encontrados)[0] if len(csts_encontrados) == 1 else f"Múltiplos ({', '.join(sorted(csts_encontrados))})"
         
         # Verifica alerta de CFOP interestadual
         if tem_cfop_6:
@@ -1445,6 +1534,8 @@ def processar_xml(
                 cnpj_destinatario=cnpj_destinatario,
                 data_emissao=data_emissao,
                 totais_impostos=totais_impostos,
+                uf_origem=uf_origem,
+                cst_principal=cst_principal,
             )
             if sucesso:
                 status_banco = "Gravada"
@@ -1466,6 +1557,7 @@ def processar_xml(
             "Valor Total (vNF)": v_nf,
             "Valor ICMS (vICMS)": v_icms,
             "CFOP": cfop_principal,
+            "CST": cst_principal or "—",
             "Sujeito a ST (PR)": "⚠️ SUJEITO A ST (PR)" if sujeito_st_pr else "Não",
             "Status Banco": status_banco,
             "Arquivo": nome_arquivo,
@@ -1655,18 +1747,8 @@ def pagina_analise_xml() -> None:
             # Tabela resumo das notas
             st.markdown("---")
             st.subheader("📋 Resumo das Notas Processadas")
-            df_resumo_display = df_resumo[
-                [
-                    "Número da Nota",
-                    "Nome do Cliente",
-                    "Valor Total (vNF)",
-                    "Valor ICMS (vICMS)",
-                    "CFOP",
-                    "Sujeito a ST (PR)",
-                    "Status Banco",
-                    "Arquivo",
-                ]
-            ].copy()
+            colunas_resumo = ["Número da Nota", "Nome do Cliente", "Valor Total (vNF)", "Valor ICMS (vICMS)", "CFOP", "CST", "Sujeito a ST (PR)", "Status Banco", "Arquivo"]
+            df_resumo_display = df_resumo[[c for c in colunas_resumo if c in df_resumo.columns]].copy()
             df_resumo_styled = df_resumo_display.style.apply(
                 lambda row: [
                     "font-weight: bold;" if ("SUJEITO A ST" in str(value) or "IRREGULAR" in str(value)) else ""
@@ -1686,18 +1768,7 @@ def pagina_analise_xml() -> None:
             if st.button("🔄 Refazer Análise de ST"):
                 resumo_notas = reprocessar_st_sessao(supabase, resumo_notas)
                 df_resumo = pd.DataFrame(resumo_notas)
-                df_resumo_display = df_resumo[
-                    [
-                        "Número da Nota",
-                        "Nome do Cliente",
-                        "Valor Total (vNF)",
-                        "Valor ICMS (vICMS)",
-                        "CFOP",
-                        "Sujeito a ST (PR)",
-                        "Status Banco",
-                        "Arquivo",
-                    ]
-                ].copy()
+                df_resumo_display = df_resumo[[c for c in colunas_resumo if c in df_resumo.columns]].copy()
                 df_resumo_styled = df_resumo_display.style.apply(
                     lambda row: [
                         "font-weight: bold;" if ("SUJEITO A ST" in str(value) or "IRREGULAR" in str(value)) else ""
@@ -1762,7 +1833,7 @@ def _gerar_pdf_auditoria(
     elements.append(Spacer(1, 0.5*cm))
 
     # Cliente e data
-    dados_cabecalho = f"<b>Cliente:</b> {nome_cliente}</br><b>Data da análise:</b> {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+    dados_cabecalho = f"<b>Cliente:</b> {nome_cliente}<br/><b>Data da análise:</b> {datetime.now().strftime('%d/%m/%Y %H:%M')}"
     elements.append(Paragraph(dados_cabecalho, styles["Normal"]))
     elements.append(Spacer(1, 1*cm))
 
@@ -1814,32 +1885,54 @@ def _gerar_pdf_auditoria(
 
 
 def _compute_auditoria_kpis(supabase: Client, nota_ids: list) -> dict:
-    """Calcula os 4 KPIs (total_itens, st_recolhida, antecipacao_pendente, valor_risco) para as notas."""
+    """Calcula os KPIs (total_itens, st_recolhida, antecipacao_pendente, irregulars, valor_risco) para as notas."""
     try:
-        resp = supabase.table("itens_nota").select("id, ncm, cest, valor_total, status_st, cfop").in_("nota_id", nota_ids).execute()
-        itens_raw = resp.data or []
+        resp_itens = supabase.table("itens_nota").select("id, nota_id, ncm, cest, valor_total, status_st, cfop").in_("nota_id", nota_ids).execute()
+        itens_raw = resp_itens.data or []
+        resp_notas = supabase.table("notas_fiscais").select("id, uf_origem").in_("id", nota_ids).execute()
+        mapa_uf_origem: dict[str, str] = {}
+        for n in (resp_notas.data or []):
+            uf = n.get("uf_origem")
+            mapa_uf_origem[str(n["id"])] = str(uf).strip().upper() if uf else ""
     except Exception:
         return {}
     ncm_base_cache: dict[str, bool] = {}
     st_recolhida = 0
     antecipacao_pendente = 0
+    irregulars = 0
     valor_risco = 0.0
     for item in itens_raw:
         valor = float(item.get("valor_total", 0) or 0)
         ncm = item.get("ncm")
         cest = item.get("cest")
         cfop = item.get("cfop")
+        nota_id = str(item.get("nota_id", ""))
+        uf_origem = mapa_uf_origem.get(nota_id, "")
+        status_db = (item.get("status_st") or "").strip()
+        sujeito_st = bool(item.get("status_st"))
+        irregular_db = sujeito_st and (STATUS_IRREGULAR_ST in status_db or "IRREGULAR" in status_db)
         cache_key = f"{ncm}|{cest or ''}"
         if cache_key not in ncm_base_cache:
             ncm_base_cache[cache_key] = buscar_regra_st(supabase, ncm, cest) is not None
         ncm_na_base = ncm_base_cache[cache_key]
-        cfop_subst = cfop_substituicao(cfop)
-        if ncm_na_base and cfop_subst:
+        cfop_54_64 = cfop_inicia_54_ou_64(cfop)
+        cfop_61 = cfop_inicia_61(cfop)
+        cfop_51 = cfop_inicia_51(cfop)
+        irregular = irregular_db or (cfop_51 and ncm_na_base)
+        if irregular:
+            irregulars += 1
+        elif ncm_na_base and cfop_54_64:
             st_recolhida += 1
-        elif ncm_na_base and not cfop_subst:
+        elif (cfop_61 and uf_origem and uf_origem != "PR") or (ncm_na_base and not cfop_54_64 and not cfop_51):
             antecipacao_pendente += 1
             valor_risco += valor
-    return {"total_itens": len(itens_raw), "st_recolhida": st_recolhida, "antecipacao_pendente": antecipacao_pendente, "valor_risco": valor_risco}
+    return {
+        "total_itens": len(itens_raw),
+        "st_recolhida": st_recolhida,
+        "antecipacao_pendente": antecipacao_pendente,
+        "irregulars": irregulars,
+        "valor_risco": valor_risco,
+    }
 
 
 def _exibir_resultados_auditoria(supabase: Client, nota_ids: list) -> None:
@@ -1851,24 +1944,35 @@ def _exibir_resultados_auditoria(supabase: Client, nota_ids: list) -> None:
     try:
         resp_notas = (
             supabase.table("notas_fiscais")
-            .select("id, numero_nfe, cliente_id")
+            .select("id, numero_nfe, cliente_id, uf_origem")
             .in_("id", nota_ids)
             .execute()
         )
+        mapa_uf_origem: dict[str, str] = {}
         for n in resp_notas.data or []:
             mapa_nota[str(n["id"])] = n.get("numero_nfe", "")
+            uf = n.get("uf_origem")
+            mapa_uf_origem[str(n["id"])] = str(uf).strip().upper() if uf else ""
         ids_clientes = {str(n["cliente_id"]) for n in (resp_notas.data or []) if n.get("cliente_id")}
         if ids_clientes:
             resp_c = supabase.table("clientes").select("id, nome_fantasia, razao_social").in_("id", list(ids_clientes)).execute()
             for c in resp_c.data or []:
                 mapa_cliente[str(c["id"])] = c.get("nome_fantasia") or c.get("razao_social") or str(c["id"])
 
-        resp_itens = (
-            supabase.table("itens_nota")
-            .select("id, nota_id, descricao, ncm, cest, valor_total, status_st, codigo_produto, cfop")
-            .in_("nota_id", nota_ids)
-            .execute()
-        )
+        try:
+            resp_itens = (
+                supabase.table("itens_nota")
+                .select("id, nota_id, descricao, ncm, cest, valor_total, status_st, codigo_produto, cfop, cst")
+                .in_("nota_id", nota_ids)
+                .execute()
+            )
+        except Exception:
+            resp_itens = (
+                supabase.table("itens_nota")
+                .select("id, nota_id, descricao, ncm, cest, valor_total, status_st, codigo_produto, cfop")
+                .in_("nota_id", nota_ids)
+                .execute()
+            )
         itens_raw = resp_itens.data or []
     except Exception as exc:
         st.error(f"Erro ao carregar itens: {exc}")
@@ -1881,29 +1985,35 @@ def _exibir_resultados_auditoria(supabase: Client, nota_ids: list) -> None:
         valor = float(item.get("valor_total", 0) or 0)
         sujeito_st = bool(item.get("status_st"))
         status_db = (item.get("status_st") or "").strip()
-        irregular = sujeito_st and (STATUS_IRREGULAR_ST in status_db or "IRREGULAR" in status_db)
+        irregular_db = sujeito_st and (STATUS_IRREGULAR_ST in status_db or "IRREGULAR" in status_db)
 
-        # Lógica tripla de status: NCM na base + CFOP de substituição/operação comum
+        # Lógica de status: NCM na base + CFOP + UF de origem
         ncm = item.get("ncm")
         cest = item.get("cest")
         cfop = item.get("cfop")
+        nota_id = str(item.get("nota_id", ""))
+        uf_origem = mapa_uf_origem.get(nota_id, "")
         cache_key = f"{ncm}|{cest or ''}"
         if cache_key not in ncm_base_cache:
             ncm_base_cache[cache_key] = buscar_regra_st(supabase, ncm, cest) is not None
         ncm_na_base = ncm_base_cache[cache_key]
         cfop_subst = cfop_substituicao(cfop)
+        cfop_54_64 = cfop_inicia_54_ou_64(cfop)
+        cfop_61 = cfop_inicia_61(cfop)
+        cfop_51 = cfop_inicia_51(cfop)
 
-        # Status visual — Lógica Tripla:
-        # ✅ ST RECOLHIDA: NCM na base + CFOP de substituição (5401, 5403, 5405, 6401, 6403, 6405)
-        # 🚨 ANTECIPAÇÃO PENDENTE: NCM na base + CFOP de operação comum (5102, 6102, etc.) — foco principal
-        # ⚪ OPERAÇÃO COMUM: NCM não sujeito a ST na base
+        # Status visual — Lógica atualizada:
+        # ❌ IRREGULAR: já irregular no XML OU CFOP 5.1 (venda interna) que deveria ter ST
+        # ✅ ST RECOLHIDA: NCM na base + CFOP 5.4 ou 6.4
+        # 🚨 ANTECIPAÇÃO PENDENTE: CFOP 6.1 de fora do PR (ST na entrada) OU NCM na base + CFOP comum
+        irregular = irregular_db or (cfop_51 and ncm_na_base)
         if irregular:
             status_badge = "❌ IRREGULAR"
             diagnostico = DIAGNOSTICO_ERRO_ST
-        elif ncm_na_base and cfop_subst:
+        elif ncm_na_base and cfop_54_64:
             status_badge = BADGE_ST_RECOLHIDA
             diagnostico = DIAGNOSTICO_ST_RECOLHIDA
-        elif ncm_na_base and not cfop_subst:
+        elif (cfop_61 and uf_origem and uf_origem != "PR") or (ncm_na_base and not cfop_54_64 and not cfop_51):
             status_badge = BADGE_ANTECIPACAO_PENDENTE
             diagnostico = DIAGNOSTICO_ANTECIPACAO_PENDENTE
         elif sujeito_st and not ncm_na_base and cfop_indica_st(cfop):
@@ -1923,6 +2033,7 @@ def _exibir_resultados_auditoria(supabase: Client, nota_ids: list) -> None:
             "NCM": item.get("ncm") or "—",
             "CEST": item.get("cest") or "—",
             "CFOP": item.get("cfop") or "—",
+            "CST": item.get("cst") or "—",
             "Valor Item": valor,
             "_sujeito_st": sujeito_st,
             "_irregular": irregular,
@@ -1946,6 +2057,7 @@ def _exibir_resultados_auditoria(supabase: Client, nota_ids: list) -> None:
         "total_itens": total_itens,
         "st_recolhida": st_recolhida,
         "antecipacao_pendente": antecipacao_pendente,
+        "irregulars": irregulars,
         "valor_risco": valor_risco,
     }
 
@@ -1994,7 +2106,8 @@ def _exibir_resultados_auditoria(supabase: Client, nota_ids: list) -> None:
 
     # 4. Tabela de Detalhes (AgGrid com destaque para Antecipação Pendente)
     st.subheader("📋 Tabela de Detalhes — Validação de Sujeição")
-    colunas_exibir = ["Status", "Diagnóstico Fiscal", "Número NF", "Descrição", "NCM", "CEST", "CFOP", "Valor Item"]
+    colunas_exibir = ["Status", "Diagnóstico Fiscal", "Número NF", "Descrição", "NCM", "CEST", "CFOP", "CST", "Valor Item"]
+    colunas_exibir = [c for c in colunas_exibir if c in df_exibir.columns]
     df_tabela = df_exibir[colunas_exibir].copy()
     df_tabela["Valor Item"] = df_tabela["Valor Item"].apply(lambda x: f"R$ {x:,.2f}")
 
@@ -2134,8 +2247,10 @@ def pagina_painel_auditoria() -> None:
         inicio = datetime.combine(data_inicial, datetime.min.time()).isoformat() + "Z" if data_inicial else None
         fim = datetime.combine(data_final, datetime.max.time()).isoformat() + "Z" if data_final else None
 
-        def _exec_query(com_cnpj: bool, com_data_emissao: bool = True):
+        def _exec_query(com_cnpj: bool, com_data_emissao: bool = True, com_cst: bool = True):
             base_cols = "id, numero_nfe, cliente_id, cnpj_destinatario, valor_total, icms_total, data_importacao, data_emissao" if com_cnpj else "id, numero_nfe, cliente_id, valor_total, icms_total, data_importacao, data_emissao"
+            if com_cst:
+                base_cols += ", cst_principal"
             if not com_data_emissao:
                 base_cols = base_cols.replace(", data_emissao", "")
             q = supabase.table("notas_fiscais").select(base_cols).order("data_emissao" if com_data_emissao else "data_importacao", desc=True)
@@ -2157,7 +2272,7 @@ def pagina_painel_auditoria() -> None:
             notas = list(resp.data or [])
         except Exception as exc:
             exc_str = str(exc)
-            if "cnpj_destinatario" in exc_str or "data_emissao" in exc_str or "42703" in exc_str:
+            if "cnpj_destinatario" in exc_str or "data_emissao" in exc_str or "cst_principal" in exc_str or "42703" in exc_str:
                 try:
                     # Tenta manter data_emissao (só remove cnpj_destinatario)
                     resp = _exec_query(com_cnpj=False, com_data_emissao=True)
@@ -2165,12 +2280,18 @@ def pagina_painel_auditoria() -> None:
                     usar_data_emissao = True
                 except Exception:
                     try:
-                        # Último fallback: usa data_importacao (coluna data_emissao inexistente)
-                        resp = _exec_query(com_cnpj=False, com_data_emissao=False)
-                        notas = resp.data or []
-                        usar_data_emissao = False
+                        # Tenta sem cst_principal (migration 013 não executada)
+                        resp = _exec_query(com_cnpj=False, com_data_emissao=True, com_cst=False)
+                        notas = list(resp.data or [])
+                        usar_data_emissao = True
                     except Exception:
-                        raise exc
+                        try:
+                            # Último fallback: usa data_importacao (coluna data_emissao inexistente)
+                            resp = _exec_query(com_cnpj=False, com_data_emissao=False, com_cst=False)
+                            notas = resp.data or []
+                            usar_data_emissao = False
+                        except Exception:
+                            raise exc
             else:
                 raise
 
@@ -2261,14 +2382,16 @@ def pagina_painel_auditoria() -> None:
             "Cliente": _col_cliente(n),
             "Valor Total": float(n.get("valor_total", 0)),
             "ICMS Total": float(n.get("icms_total", 0)),
+            "CST": n.get("cst_principal") or "—",
             "Data Emissão": n.get("data_emissao") or (n.get("data_importacao", "")[:10] if n.get("data_importacao") else ""),
             "_nota_id": n["id"],
         }
         for n in notas
     ])
 
+    colunas_tabela = ["Selecionar", "Número NF", "Cliente", "Valor Total", "ICMS Total", "CST", "Data Emissão"]
     df_editado = st.data_editor(
-        df_notas[["Selecionar", "Número NF", "Cliente", "Valor Total", "ICMS Total", "Data Emissão"]],
+        df_notas[[c for c in colunas_tabela if c in df_notas.columns]],
         use_container_width=True,
         hide_index=True,
         column_config={
