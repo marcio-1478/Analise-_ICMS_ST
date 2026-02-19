@@ -389,11 +389,56 @@ def pagina_login() -> bool:
 
 
 def pagina_configuracoes() -> None:
-    """Aba de configurações (apenas admin): cadastro de até 9 funcionários."""
+    """Aba de configurações: alterar senha (todos) e gestão de usuários (apenas admin)."""
     st.header("⚙️ Configurações")
-    st.caption("Gestão de usuários — acesso restrito ao administrador.")
-
     supabase = require_supabase()
+
+    # Seção: Alterar minha senha (disponível para todos os usuários)
+    st.subheader("🔐 Alterar minha senha")
+    with st.form("form_alterar_senha"):
+        senha_atual = st.text_input("Senha atual", type="password", placeholder="Digite sua senha atual")
+        nova_senha = st.text_input("Nova senha", type="password", placeholder="Mínimo 6 caracteres")
+        confirmar_senha = st.text_input("Confirmar nova senha", type="password", placeholder="Repita a nova senha")
+
+        if st.form_submit_button("Alterar senha"):
+            username = st.session_state.get("username")
+            if not username:
+                st.error("Sessão inválida. Faça login novamente.")
+            elif not senha_atual or not senha_atual.strip():
+                st.error("Informe a senha atual.")
+            elif not nova_senha or len(nova_senha.strip()) < 6:
+                st.error("A nova senha deve ter pelo menos 6 caracteres.")
+            elif nova_senha.strip() != confirmar_senha.strip():
+                st.error("A nova senha e a confirmação não coincidem.")
+            else:
+                try:
+                    resp = supabase.table("usuarios").select("id, senha").eq("usuario", username).execute()
+                    if not resp.data or len(resp.data) == 0:
+                        st.error("Usuário não encontrado.")
+                    else:
+                        row = resp.data[0]
+                        hash_banco = (row.get("senha") or "").strip()
+                        if not _senha_confere(senha_atual.strip(), hash_banco):
+                            st.error("Senha atual incorreta.")
+                        else:
+                            hash_nova = _hash_senha_sha256(nova_senha.strip())
+                            supabase.table("usuarios").update({"senha": hash_nova}).eq("id", row["id"]).execute()
+                            st.success("Senha alterada com sucesso!")
+                            st.balloons()
+                            st.rerun()
+                except Exception as exc:
+                    st.error(f"Erro ao alterar senha: {exc}")
+
+    st.markdown("---")
+
+    # Seção: Gestão de usuários (apenas admin)
+    eh_admin = st.session_state.get("username") == "admin"
+    if not eh_admin:
+        st.caption("A gestão de funcionários é restrita ao administrador.")
+        return
+
+    st.subheader("Gestão de usuários")
+    st.caption("Cadastro de até 9 funcionários.")
 
     # Conta usuários (excluindo admin)
     try:
@@ -2633,13 +2678,8 @@ def main() -> None:
         pagina_login()
         return
 
-    # Menu: Configurações só para admin
-    eh_admin = st.session_state.get("username") == "admin"
-    options_base = ["Gestão de Clientes", "Análise de XML", "Painel de Auditoria", "Base Normativa"]
-    icons_base = ["house", "shield-check", "bar-chart", "database"]
-    if eh_admin:
-        options_base.append("Configurações")
-        icons_base.append("gear")
+    options_base = ["Gestão de Clientes", "Análise de XML", "Painel de Auditoria", "Base Normativa", "Configurações"]
+    icons_base = ["house", "shield-check", "bar-chart", "database", "gear"]
 
     menu_map = {
         "Gestão de Clientes": "clientes",
