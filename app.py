@@ -17,11 +17,7 @@ try:
 except ImportError:
     HAS_AGGRID = False
 
-try:
-    from streamlit_option_menu import option_menu
-    HAS_OPTION_MENU = True
-except ImportError:
-    HAS_OPTION_MENU = False
+from streamlit_option_menu import option_menu
 
 try:
     from reportlab.lib import colors
@@ -2653,8 +2649,8 @@ def main() -> None:
         "Configurações": "config",
     }
 
-    # Sidebar: logo + streamlit_option_menu + Logout
     with st.sidebar:
+        # Logo/título
         logo_path = Path(__file__).resolve().parent / "assets" / "logo.png"
         if logo_path.exists():
             st.image(str(logo_path), use_container_width=True)
@@ -2671,23 +2667,19 @@ def main() -> None:
             )
         st.markdown("<br>", unsafe_allow_html=True)
 
-        if HAS_OPTION_MENU:
-            menu = option_menu(
-                menu_title=None,
-                options=options_base,
-                icons=icons_base,
-                default_index=0,
-                styles={
-                    "container": {"padding": "0", "background-color": "transparent"},
-                    "icon": {"color": "#58A6FF", "font-size": "1.1rem"},
-                    "nav-link": {"font-size": "0.95rem", "color": "#8B949E", "padding": "12px 16px"},
-                    "nav-link-selected": {"background-color": "#1E2129", "color": "#E6EDF3", "border-radius": "8px"},
-                },
-            )
-            menu_key = menu_map.get(menu, "clientes")
-        else:
-            sel = st.radio("Navegação", options_base, label_visibility="collapsed")
-            menu_key = menu_map.get(sel, "clientes")
+        menu = option_menu(
+            menu_title=None,
+            options=options_base,
+            icons=icons_base,
+            default_index=0,
+            styles={
+                "container": {"padding": "0", "background-color": "transparent"},
+                "icon": {"color": "#58A6FF", "font-size": "1.1rem"},
+                "nav-link": {"font-size": "0.95rem", "color": "#8B949E", "padding": "12px 16px"},
+                "nav-link-selected": {"background-color": "#1E2129", "color": "#E6EDF3", "border-radius": "8px"},
+            },
+        )
+        menu_key = menu_map.get(menu, "clientes")
 
         st.markdown("---")
         st.caption(f"Logado como **{st.session_state['user']}**")
